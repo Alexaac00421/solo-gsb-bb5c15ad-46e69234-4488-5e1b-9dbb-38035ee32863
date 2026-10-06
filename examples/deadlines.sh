@@ -2,9 +2,13 @@
 # 本轮用法端到端示例: 当前发布版的统一 UTC 评审截止时刻
 #   录入/发布 -> 一确认未交/一未确认 -> 设置截止 (携带 资料修订号 + 发布序号) ->
 #   查看各槽位状态 -> 截止到达后: 逾期槽位不能再确认/交评语, 已交评语与收据仍有效 ->
+#   【修复】模拟首次设置响应丢失, 截止到点后用相同参数重试: 同版同值即使截止已过
+#   也回原设置 + changed=false (不写新记录、不推进修订号/序号), 不再误判 422;
+#   同版异值即使过了截止仍是 409 (不覆盖) ->
 #   补位预演释放逾期槽位 (即使已确认), 且不再把该稿分给该逾期评审人 -> 补位发布 ->
 #   旧版截止不约束新发布版 (新版可再设自己的截止)
-# 截止时刻必须显式携带时区 (Z / +00:00 / +08:00), 服务端归一化为 UTC, 且晚于当前时刻。
+# 截止时刻必须显式携带时区 (Z / +00:00 / +08:00), 服务端归一化为 UTC;
+# 严格晚于服务端当前时刻只对"同版首次设置"生效。
 # 建议对新库运行: ./examples/deadlines.sh [BASE_URL]
 set -euo pipefail
 
@@ -84,6 +88,24 @@ curl -s -X POST "$BASE/reviewer/assignments/P1/review" \
   -H 'Content-Type: application/json' \
   -d "{\"paper_id\":\"P1\",\"serial\":$SERIAL,\"score\":4,\"comment\":\"R1 的正式评语\"}" \
   | j "{'changed': d['changed'], 'receipt': d['receipt']}"
+
+echo "== 8b. 截止已过: 模拟首次设置响应丢失, 用【相同参数】重试设置 =="
+echo "    同版同值 (归一化 UTC 相等) 即使截止已过也回原设置 + changed=false,"
+echo "    不写新记录、不推进修订号/序号 —— 不会再被误判为过期时刻 422。"
+curl -s -X POST "$BASE/review-deadline" -H "$ORG" -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": $REV, \"base_serial\": $SERIAL, \"deadline_at\": \"$DEADLINE\"}" \
+  | j "{'http_hint': '同参重试 (已过截止)', 'changed': d['changed'], 'revision': d['revision'], 'serial': d['serial'], 'deadline_at': d['review_deadline']['deadline_at'], 'set_at': d['review_deadline']['set_at']}"
+# 同一瞬间的另一种时区写法 (+08:00) 也按同值幂等
+DL_CN=$(DL="$DEADLINE" python3 -c 'import os; from datetime import datetime, timezone, timedelta; print(datetime.fromisoformat(os.environ["DL"].replace("Z","+00:00")).astimezone(timezone(timedelta(hours=8))).isoformat())')
+curl -s -X POST "$BASE/review-deadline" -H "$ORG" -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": $REV, \"base_serial\": $SERIAL, \"deadline_at\": \"$DL_CN\"}" \
+  | j "{'http_hint': '同一瞬间 +08:00 写法', 'changed': d['changed']}"
+# 同版异值即使截止已过仍是 409, 不覆盖原设置
+FUTURE=$(python3 -c 'from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)+timedelta(days=1)).isoformat().replace("+00:00","Z"))')
+curl -s -o /dev/null -w '过截止后同版异值   -> HTTP %{http_code} (409, 不覆盖)\n' -X POST "$BASE/review-deadline" \
+  -H "$ORG" -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": $REV, \"base_serial\": $SERIAL, \"deadline_at\": \"$FUTURE\"}"
+
 curl -s "$BASE/review-deadline" -H "$ORG" \
   | j "{'deadline_expired': d['deadline_expired'], 'summary': d['summary']}"
 

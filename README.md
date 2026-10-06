@@ -127,13 +127,18 @@ UTC 评审截止时刻（`POST /review-deadline`，请求体
 `{"base_revision": N, "base_serial": M, "deadline_at": "2026-11-01T12:00:00Z"}`）；
 **未设置截止时一切沿用既有行为**：
 
-- 设置在**同一个写事务（`BEGIN IMMEDIATE`）内同时核对资料修订号与发布序号**：
-  尚未发布 `404`；修订号或序号过期/超前 `409`，**拒绝不改变当前方案、截止设置及历史记录**；
+- 设置在**同一个写事务（`BEGIN IMMEDIATE`）内先核对发布版、资料修订号与发布序号**，
+  再解析时刻：尚未发布 `404`；修订号或序号过期/超前 `409`（**优先于时刻解析**），
+  **拒绝不改变当前方案、截止设置及历史记录**；
 - 截止时刻必须可解析为 **ISO 8601、显式携带时区**（`Z`/`+00:00`/`+08:00` 等，
-  服务端**归一化为 UTC**），且**严格晚于设置时的服务端当前时刻**，否则 `422`；
-- **同一发布版只能设置一次**：归一化 UTC 后**同版同时刻重试幂等**（`changed=false`，
-  不产生新变更、不写新行、不推进修订号/序号）；**同版异时刻 `409` 拒绝**
-  （截止不修改、不覆盖）；设置截止本身**不推进资料修订号与发布序号**；
+  服务端**归一化为 UTC**），否则 `422`；**严格晚于服务端设置时刻只对同版首次设置
+  生效**——首次设置给到点/过去时刻 `422`；
+- **同一发布版只能设置一次**，一律按**归一化后的 UTC 时刻**核对同版已存设置，且该
+  核对与"截止现在是否已过"无关：**同版同值重试幂等**（`changed=false`，返回**原设置**，
+  不写新行、不推进修订号/序号），**即使截止已到点**——这样首个请求其实成功、但**响应
+  丢失**时，调用方在截止过后用相同参数重试也能拿到原设置而**不会被误判为过期时刻
+  `422`**；**同版异时刻 `409` 拒绝且不覆盖**（即使截止已过）；设置截止本身**不推进
+  资料修订号与发布序号**；
 - `GET /review-deadline` 可随时查看当前发布版的截止设置、是否已到截止、服务端当前
   UTC 时刻，以及各槽位状态与汇总：`unconfirmed`（未确认）、`confirmed_unsubmitted`
   （已确认未交）、`submitted`（已交）、`recused`（已回避，不计逾期）、`overdue`
@@ -474,7 +479,7 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | POST | `/assignment/publish` | 发布：携带 `{"base_revision": N}`，修订号过期 `409`，无可行方案 `422` |
 | POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` 及各等级已分配/未分配数量（`level_summary`）；无法完整覆盖时同样按 总数→高/中等级数→字典序 选取部分方案；**删除冻结的旧序号槽位在 `deleted_frozen_slots` 列明（补位发布时不沿用确认）**；**统一截止逾期只计当前仍有效槽位：删除冻结槽位（含同编号重录未重新发布）与撤回槽位不进 `overdue_slots`，旧截止不得阻止重录稿再次分给原评审人；其他论文真实逾期照常释放并以 `review_overdue` 禁止该稿原槽位重分** |
 | POST | `/assignment/backfill/publish` | 补位发布：`{"base_revision": N, "base_serial": M}` 双版本复核，过期 `409`，补不齐 `422`（均不改当前发布版）；响应附 `carried_confirmations`/`carried_reviews` 与 **`released_deleted_confirmations`/`deleted_frozen_slots`（删除重录后旧确认不沿用，须按新序号重新确认）**、`released_overdue_confirmations`/`overdue_slots`（真实逾期释放，两类冻结/逾期口径与预演一致，发布方案与预演相同） |
-| POST | `/review-deadline` | 为当前发布版设置一次统一 UTC 评审截止：`{"base_revision":N,"base_serial":M,"deadline_at":"2026-11-01T12:00:00Z"}`；时刻须显式携带时区（归一化 UTC）且晚于当前时刻；尚未发布 `404`，修订号/序号不符 `409`，非法/过去时刻 `422`；同版同时刻重试幂等（`changed=false`），同版异时刻 `409`；设置不推进修订号/序号、不改方案与历史 |
+| POST | `/review-deadline` | 为当前发布版设置一次统一 UTC 评审截止：`{"base_revision":N,"base_serial":M,"deadline_at":"2026-11-01T12:00:00Z"}`；写事务内先核对发布版/修订号/序号，再解析时刻（须显式携带时区、归一化 UTC）；尚未发布 `404`，修订号/序号不符 `409`（优先于时刻解析），非法/无时区时刻 `422`，**首次设置给到点/过去时刻 `422`**；**按归一化 UTC 时刻核对同版已存设置（与截止是否已过无关）：同版同值重试即使截止已过也幂等返回原设置（`changed=false`，不写新行、不推进修订号/序号），同版异时刻 `409` 不覆盖**；设置不推进修订号/序号、不改方案与历史 |
 | GET | `/review-deadline` | 会务方查看当前发布版截止设置、是否已到截止、服务端 UTC 时刻，以及各槽位状态（`unconfirmed`/`confirmed_unsubmitted`/`submitted`/`recused`/`overdue`）与汇总计数；已撤回槽位单独标记（`withdrawn`）、不计入汇总；**删除凭据冻结当前序号的历史槽位（含同编号重录但未重新发布）带 `deleted=true` 标记并显示删除前历史状态，但不判逾期、不计入 `summary`，另以 `deleted_slots` 计数（旧确认/评语仅供会务方追溯）** |
 | GET | `/assignment` | 查询已发布方案（含 `serial`）及每篇论文的分配/排除原因、每槽位确认/回避状态；撤回稿仍在当前发布版视图中但带 `withdrawn=true` 与 `withdrawal_reason`（另返回 `withdrawn_papers` 清单），评审人侧则立即不可见 |
 | GET | `/papers/{paper_id}/reviews` | 会务方按论文查看当前两名评审人的评语提交进度、评语全文，及被移出槽位的追溯评语（`archived_reviews`）与全部更正记录（`corrections`）；撤回稿返回 `withdrawn=true` 与撤回记录（撤回后又重新发布过普通方案时 `slots` 为空、原评语全部在 `archived_reviews`） |
@@ -996,7 +1001,8 @@ curl -X POST $BASE/reviewer/assignments/P1/decision \
   -H 'Content-Type: application/json' -d '{"paper_id":"P1","decision":"confirm"}'
 
 # 68. 会务方取最新 revision + 当前 serial, 为当前发布版设置一次统一 UTC 截止
-#     时刻须显式携带时区 (Z / +00:00 / +08:00), 归一化为 UTC, 且晚于设置时刻
+#     时刻须显式携带时区 (Z / +00:00 / +08:00), 归一化为 UTC;
+#     "严格晚于服务端当前时刻" 只对同版首次设置生效
 REV=$(curl -s $BASE/meta -H "$ORG" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')
 SER=$(curl -s $BASE/assignment -H "$ORG" | python3 -c 'import sys,json;print(json.load(sys.stdin)["serial"])')
 curl -X POST $BASE/review-deadline -H "$ORG" -H 'Content-Type: application/json' \
@@ -1005,8 +1011,11 @@ curl -X POST $BASE/review-deadline -H "$ORG" -H 'Content-Type: application/json'
 #     "review_deadline":{"serial":S,"revision":N,
 #                        "deadline_at":"2026-11-01T12:00:00+00:00","set_at":"..."}}
 
-# 69. 同版同时刻重试 -> changed=false (不产生新变更, 不推进修订号/序号);
-#     同版异时刻 -> 409; 修订号/序号不符 -> 409; 无时区/过去时刻 -> 422; 尚未发布 -> 404
+# 69. 同版同值重试 -> changed=false (返回原设置, 不写新行, 不推进修订号/序号);
+#     【即使截止已过】同值重试仍幂等 —— 首个请求成功但响应丢失时, 调用方截止到点后
+#     用相同参数重试拿到的是原设置, 而非"过期时刻" 422;
+#     同版异时刻 -> 409 (不覆盖); 修订号/序号不符 -> 409 (优先于时刻解析);
+#     无时区/无法解析时刻 -> 422; 首次设置给到点/过去时刻 -> 422; 尚未发布 -> 404
 #     (被拒请求不改变当前方案、截止设置及历史记录)
 curl -X POST $BASE/review-deadline -H "$ORG" -H 'Content-Type: application/json' \
   -d "{\"base_revision\": $REV, \"base_serial\": $SER, \"deadline_at\": \"2026-11-01T20:00:00+08:00\"}"

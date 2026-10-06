@@ -109,13 +109,17 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_future_deadline(raw: str, now: datetime):
-    """解析会务方提交的截止时刻字符串。
+def _parse_deadline(raw: str) -> datetime:
+    """解析会务方提交的截止时刻字符串: 仅做格式/时区解析并归一化为 UTC。
 
     接受 ISO 8601 且显式携带时区的时刻 (如 2026-10-04T12:00:00Z /
-    +00:00 / +08:00), 归一化为 UTC; 无法解析或未显式携带时区 -> ValueError;
-    时刻不严格晚于 now -> ValueError (非法时刻一律 422 拒绝)。
-    返回归一化后的带时区 datetime。
+    +00:00 / +08:00), 归一化为带时区的 UTC datetime; 无法解析或未显式携带
+    时区 -> ValueError (调用方一律按 422 拒绝)。
+
+    注意: 此处刻意不做"必须晚于当前时刻"判定。未来性只对"同版首次设置"
+    成立, 且必须在写事务内、确认同版无已存设置之后再判定; 同版同值重试
+    (含首个请求成功但响应丢失、调用方在截止到点后用相同参数重试) 即使截止
+    已过也必须幂等返回原设置, 不能因当前时刻已晚于截止而误判为非法时刻。
     """
     text = raw.strip()
     try:
@@ -124,10 +128,7 @@ def _parse_future_deadline(raw: str, now: datetime):
         raise ValueError(f"无法解析为 ISO 8601 日期时刻: {raw!r}")
     if dt.tzinfo is None:
         raise ValueError("截止时刻必须显式携带时区 (UTC, 例如 2026-10-04T12:00:00Z)")
-    dt = dt.astimezone(timezone.utc)
-    if dt <= now:
-        raise ValueError("截止时刻必须晚于设置时的服务端当前时刻 (UTC)")
-    return dt
+    return dt.astimezone(timezone.utc)
 
 
 def _deadline_view(row):
@@ -1448,23 +1449,22 @@ def set_review_deadline(body: ReviewDeadlineIn, _: bool = Depends(require_organi
       - 请求在同一个写事务内先核对 资料修订号 base_revision 与发布序号 base_serial:
         任一过期/超前 -> 409, 拒绝且不改变当前方案、截止设置及历史记录;
       - 截止时刻必须可解析为 ISO 8601、显式携带时区 (Z/+00:00 等, 归一化为 UTC),
-        且严格晚于设置时的服务端当前时刻, 否则 422;
-      - 同版 (同一发布序号) 只能设置一次: 同版同时刻 (归一化 UTC 后相等) 重试
-        幂等返回 (changed=false, 不产生新变更、不写新行); 同版异时刻 -> 409;
+        否则 422; "严格晚于服务端设置时刻"只在同版首次设置时才要求,
+        首次设置给到点/过去时刻 -> 422;
+      - 同版 (同一发布序号) 只能设置一次, 一律按归一化后的 UTC 时刻比对已存设置,
+        且该比对与"截止现在是否已过"无关:
+        * 同版同值重试 (典型场景: 首个请求其实已成功, 但响应丢失, 调用方截止到点后
+          用相同参数重试) 即使截止已过也幂等返回原设置 (changed=false),
+          不写新记录、不推进修订号或发布序号, 绝不误判为"过期时刻"而回 422;
+        * 同版异时刻 -> 409, 不覆盖原设置;
       - 设置截止不推进资料修订号与发布序号, 不改变当前方案及任何历史记录;
         旧发布版的截止不约束新发布版 (按发布序号隔离, 推进 serial 后旧版自然失效)。
     服务端到达截止时刻后, 仍未交正式评语且未回避的槽位即逾期:
     评审人不得再确认或交评语 (已交评语及收据保持有效); 补位预演/发布释放逾期
     槽位且不再把该稿分给该逾期评审人。未设置截止时一切沿用既有行为。
     """
-    now = _utcnow()
-    try:
-        deadline_dt = _parse_future_deadline(body.deadline_at, now)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"非法评审截止时刻: {exc}")
-    deadline_iso = deadline_dt.isoformat()
-
     with db.write_txn() as conn:
+        # 1) 先在写事务内核对当前发布版是否存在及其修订号/发布序号
         published = _load_published(conn)
         if published is None:
             raise HTTPException(status_code=404, detail="尚未发布任何分配方案, 无可设置截止的发布版")
@@ -1478,10 +1478,19 @@ def set_review_deadline(body: ReviewDeadlineIn, _: bool = Depends(require_organi
                     f" 当前为 修订号 {rev}/发布序号 {serial}, 请重新查看当前发布版后再设置"
                 ),
             )
+        # 2) 版本核对通过后再解析时刻 (仅格式/时区, 归一化为 UTC); 非法/无时区 -> 422
+        try:
+            deadline_dt = _parse_deadline(body.deadline_at)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"非法评审截止时刻: {exc}")
+        deadline_iso = deadline_dt.isoformat()
+        # 3) 按归一化后的 UTC 时刻核对同版已存设置 (不看截止是否已过):
+        #    同值 -> 幂等返回原设置; 异值 -> 409。这使得"已成功但响应丢失、
+        #    截止到点后用相同参数重试"能被识别为成功重试, 而非过期时刻 422。
         existing = db.load_review_deadline(conn, serial)
         if existing is not None:
-            if existing["deadline_at"] == deadline_iso:
-                # 同版同值重试: 幂等, 不产生新变更
+            if datetime.fromisoformat(existing["deadline_at"]) == deadline_dt:
+                # 同版同值重试 (即使截止已过): 幂等, 不产生新变更、不写新记录
                 return {
                     "ok": True,
                     "changed": False,
@@ -1494,20 +1503,21 @@ def set_review_deadline(body: ReviewDeadlineIn, _: bool = Depends(require_organi
                 detail={
                     "message": (
                         "该发布版已设置过统一评审截止时刻, 同版只能设置一次:"
-                        " 同时刻重试幂等, 异时刻拒绝 (截止不修改、不覆盖)"
+                        " 同时刻重试幂等 (即使截止已过), 异时刻拒绝 (截止不修改、不覆盖)"
                     ),
                     "serial": serial,
                     "existing_deadline_at": existing["deadline_at"],
                     "requested_deadline_at": deadline_iso,
                 },
             )
-        set_at = _utcnow().isoformat()
-        # 以事务内时刻再次兜底校验, 避免解析与入事务之间的边界竞态
-        if deadline_dt <= _utcnow():
+        # 4) 同版首次设置: 时刻必须严格晚于事务内服务端当前时刻
+        now = _utcnow()
+        if deadline_dt <= now:
             raise HTTPException(
                 status_code=422,
-                detail="非法评审截止时刻: 截止时刻必须晚于设置时的服务端当前时刻 (UTC)",
+                detail="非法评审截止时刻: 首次设置的截止时刻必须晚于服务端当前时刻 (UTC)",
             )
+        set_at = now.isoformat()
         conn.execute(
             "INSERT INTO review_deadlines(serial, revision, deadline_at, set_at)"
             " VALUES (?,?,?,?)",
