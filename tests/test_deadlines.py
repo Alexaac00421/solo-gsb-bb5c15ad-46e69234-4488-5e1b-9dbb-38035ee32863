@@ -226,6 +226,87 @@ def test_same_version_same_value_idempotent(client, frozen_clock):
     assert client.get("/meta", headers=ORG).json()["revision"] == meta["revision"]
 
 
+def test_same_value_retry_after_deadline_passed_is_idempotent_not_422(client, frozen_clock):
+    """响应丢失场景: 首次设置成功后, 截止到点再用相同参数重试。
+
+    旧实现把"晚于当前时刻"校验放在写事务之前, 重试会被误判为过期时刻 422,
+    调用方无法确认首次设置是否成功。修复后: 先在写事务内核对发布版/版本号,
+    再按归一化 UTC 判定同版已存设置——同值重试即使截止已过也返回原设置
+    (changed=false), 不写新记录、不推进修订号或发布序号。
+    """
+    meta, _ = setup_published(client)
+    dl = iso(frozen_clock["now"] + timedelta(hours=1))
+    first = set_deadline(client, meta["revision"], meta["serial"], dl)
+    assert first.status_code == 200 and first.json()["changed"] is True
+    original = first.json()["review_deadline"]
+
+    # 模拟"请求响应丢失": 调用方未收到首次响应; 时钟越过截止后用完全相同参数重试
+    frozen_clock["now"] += timedelta(hours=2)
+    retry = set_deadline(client, meta["revision"], meta["serial"], dl)
+    assert retry.status_code == 200, retry.text
+    body = retry.json()
+    assert body["changed"] is False
+    assert body["review_deadline"] == original
+    assert body["revision"] == meta["revision"] and body["serial"] == meta["serial"]
+    # 不写新记录
+    with db.read_txn() as conn:
+        rows = conn.execute(
+            "SELECT serial, revision, deadline_at, set_at FROM review_deadlines"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["deadline_at"] == original["deadline_at"]
+        assert rows[0]["set_at"] == original["set_at"]
+    # 修订号/发布序号均未推进
+    cur_meta = client.get("/meta", headers=ORG).json()
+    assert cur_meta["revision"] == meta["revision"]
+    assert cur_meta["published"]["serial"] == meta["serial"]
+
+
+def test_same_instant_other_offset_retry_after_expiry_is_idempotent(client, frozen_clock):
+    """截止已过后, 用归一化为同一 UTC 时刻的不同时区表示重试, 仍幂等返回原设置。"""
+    meta, _ = setup_published(client)
+    first = set_deadline(client, meta["revision"], meta["serial"], "2026-10-04T11:00:00Z")
+    assert first.status_code == 200
+    frozen_clock["now"] += timedelta(hours=2)
+    # 北京时间 19:00 == UTC 11:00; 字符串不同但归一化 UTC 后为同一时刻
+    retry = set_deadline(
+        client, meta["revision"], meta["serial"], "2026-10-04T19:00:00+08:00"
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["changed"] is False
+    assert (
+        retry.json()["review_deadline"]["deadline_at"]
+        == first.json()["review_deadline"]["deadline_at"]
+    )
+
+
+def test_different_value_retry_after_deadline_passed_is_409_not_422(client, frozen_clock):
+    """截止已过后同版异值重试仍按冲突 409 拒绝 (不覆盖), 而非按过期时刻 422。"""
+    meta, _ = setup_published(client)
+    assert set_deadline(
+        client, meta["revision"], meta["serial"], iso(frozen_clock["now"] + timedelta(hours=1))
+    ).status_code == 200
+    frozen_clock["now"] += timedelta(hours=2)
+    other = iso(frozen_clock["now"] + timedelta(hours=1))  # 相对当前仍是未来时刻
+    r = set_deadline(client, meta["revision"], meta["serial"], other)
+    assert r.status_code == 409, r.text
+    # 原设置不变
+    view = client.get("/review-deadline", headers=ORG).json()
+    assert view["review_deadline"]["deadline_at"].startswith("2026-10-04T10:00:00")
+    with db.read_txn() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM review_deadlines").fetchone()["c"] == 1
+
+
+def test_first_set_after_expired_clock_still_requires_future(client, frozen_clock):
+    """尚未设置过截止的发布版, 首次设置过去时刻仍 422, 不落库。"""
+    meta, _ = setup_published(client)
+    past = iso(frozen_clock["now"] - timedelta(seconds=1))
+    r = set_deadline(client, meta["revision"], meta["serial"], past)
+    assert r.status_code == 422
+    with db.read_txn() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM review_deadlines").fetchone()["c"] == 0
+
+
 def test_same_version_different_value_rejected_409(client, frozen_clock):
     meta, _ = setup_published(client)
     dl1 = iso(frozen_clock["now"] + timedelta(hours=2))

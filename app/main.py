@@ -109,13 +109,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_future_deadline(raw: str, now: datetime):
-    """解析会务方提交的截止时刻字符串。
+def _parse_deadline(raw: str):
+    """解析会务方提交的截止时刻字符串 (仅做语法与时区校验)。
 
     接受 ISO 8601 且显式携带时区的时刻 (如 2026-10-04T12:00:00Z /
-    +00:00 / +08:00), 归一化为 UTC; 无法解析或未显式携带时区 -> ValueError;
-    时刻不严格晚于 now -> ValueError (非法时刻一律 422 拒绝)。
-    返回归一化后的带时区 datetime。
+    +00:00 / +08:00), 归一化为 UTC; 无法解析或未显式携带时区 -> ValueError。
+    **不做"是否晚于当前时刻"判定**: 该判定只对"首次设置"生效
+    (见 set_review_deadline), 同版同值重试即使截止已过也必须幂等返回,
+    不能在进入写事务核对已存设置之前就被误判为过期时刻 (422)。
     """
     text = raw.strip()
     try:
@@ -124,10 +125,7 @@ def _parse_future_deadline(raw: str, now: datetime):
         raise ValueError(f"无法解析为 ISO 8601 日期时刻: {raw!r}")
     if dt.tzinfo is None:
         raise ValueError("截止时刻必须显式携带时区 (UTC, 例如 2026-10-04T12:00:00Z)")
-    dt = dt.astimezone(timezone.utc)
-    if dt <= now:
-        raise ValueError("截止时刻必须晚于设置时的服务端当前时刻 (UTC)")
-    return dt
+    return dt.astimezone(timezone.utc)
 
 
 def _deadline_view(row):
@@ -1447,19 +1445,24 @@ def set_review_deadline(body: ReviewDeadlineIn, _: bool = Depends(require_organi
       - 尚未发布任何方案 -> 404;
       - 请求在同一个写事务内先核对 资料修订号 base_revision 与发布序号 base_serial:
         任一过期/超前 -> 409, 拒绝且不改变当前方案、截止设置及历史记录;
-      - 截止时刻必须可解析为 ISO 8601、显式携带时区 (Z/+00:00 等, 归一化为 UTC),
-        且严格晚于设置时的服务端当前时刻, 否则 422;
-      - 同版 (同一发布序号) 只能设置一次: 同版同时刻 (归一化 UTC 后相等) 重试
+      - 截止时刻必须可解析为 ISO 8601、显式携带时区 (Z/+00:00 等, 归一化为 UTC);
+        无法解析或未携带时区一律 422; 仅"首次设置"还要求严格晚于设置时的服务端
+        当前时刻 (422)——同版同值重试即使截止已过也按下面的幂等规则返回;
+      - 同版 (同一发布序号) 只能设置一次: 归一化 UTC 后同版同时刻重试
         幂等返回 (changed=false, 不产生新变更、不写新行); 同版异时刻 -> 409;
+        该核对在版本核对之后、在写事务内完成, 因此"首次请求成功但响应丢失、
+        截止到点后同参数重试"仍能取回原设置, 不会被误判为过期时刻;
       - 设置截止不推进资料修订号与发布序号, 不改变当前方案及任何历史记录;
         旧发布版的截止不约束新发布版 (按发布序号隔离, 推进 serial 后旧版自然失效)。
     服务端到达截止时刻后, 仍未交正式评语且未回避的槽位即逾期:
     评审人不得再确认或交评语 (已交评语及收据保持有效); 补位预演/发布释放逾期
     槽位且不再把该稿分给该逾期评审人。未设置截止时一切沿用既有行为。
     """
-    now = _utcnow()
+    # 语法/时区校验与库状态无关, 可在写事务外完成; "必须晚于当前时刻"只约束首次
+    # 设置, 必须推迟到写事务内核到"该版尚无已存设置"之后判定, 否则截止到点后的
+    # 同值重试 (首次设置其实已成功, 只是响应丢失) 会被误判为过期时刻 422。
     try:
-        deadline_dt = _parse_future_deadline(body.deadline_at, now)
+        deadline_dt = _parse_deadline(body.deadline_at)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"非法评审截止时刻: {exc}")
     deadline_iso = deadline_dt.isoformat()
@@ -1480,8 +1483,10 @@ def set_review_deadline(body: ReviewDeadlineIn, _: bool = Depends(require_organi
             )
         existing = db.load_review_deadline(conn, serial)
         if existing is not None:
-            if existing["deadline_at"] == deadline_iso:
-                # 同版同值重试: 幂等, 不产生新变更
+            existing_dt = datetime.fromisoformat(existing["deadline_at"])
+            if existing_dt == deadline_dt:
+                # 同版同值重试 (含"首次成功后响应丢失、截止到点后同参数重试"):
+                # 幂等返回原设置, 即使截止已过也不判 422; 不写新行、不推进版本号
                 return {
                     "ok": True,
                     "changed": False,
@@ -1501,17 +1506,18 @@ def set_review_deadline(body: ReviewDeadlineIn, _: bool = Depends(require_organi
                     "requested_deadline_at": deadline_iso,
                 },
             )
-        set_at = _utcnow().isoformat()
-        # 以事务内时刻再次兜底校验, 避免解析与入事务之间的边界竞态
-        if deadline_dt <= _utcnow():
+        # 首次设置: 时刻必须严格晚于事务内服务端当前时刻 (BEGIN IMMEDIATE 已取锁,
+        # 与评语提交/确认/补位发布串行), 边界竞态由本事务内判定兜底
+        now = _utcnow()
+        if deadline_dt <= now:
             raise HTTPException(
                 status_code=422,
-                detail="非法评审截止时刻: 截止时刻必须晚于设置时的服务端当前时刻 (UTC)",
+                detail="非法评审截止时刻: 首次设置的截止时刻必须晚于设置时的服务端当前时刻 (UTC)",
             )
         conn.execute(
             "INSERT INTO review_deadlines(serial, revision, deadline_at, set_at)"
             " VALUES (?,?,?,?)",
-            (serial, rev, deadline_iso, set_at),
+            (serial, rev, deadline_iso, now.isoformat()),
         )
         row = db.load_review_deadline(conn, serial)
     return {

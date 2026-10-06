@@ -127,13 +127,18 @@ UTC 评审截止时刻（`POST /review-deadline`，请求体
 `{"base_revision": N, "base_serial": M, "deadline_at": "2026-11-01T12:00:00Z"}`）；
 **未设置截止时一切沿用既有行为**：
 
-- 设置在**同一个写事务（`BEGIN IMMEDIATE`）内同时核对资料修订号与发布序号**：
-  尚未发布 `404`；修订号或序号过期/超前 `409`，**拒绝不改变当前方案、截止设置及历史记录**；
+- 设置在**同一个写事务（`BEGIN IMMEDIATE`）内按序判定**：先核对当前发布版与
+  资料修订号、发布序号——尚未发布 `404`；修订号或序号过期/超前 `409`，
+  **拒绝不改变当前方案、截止设置及历史记录**；再按归一化后的 UTC 时刻核对
+  该版已存设置；最后（仅首次设置）才校验时刻早晚；
 - 截止时刻必须可解析为 **ISO 8601、显式携带时区**（`Z`/`+00:00`/`+08:00` 等，
-  服务端**归一化为 UTC**），且**严格晚于设置时的服务端当前时刻**，否则 `422`；
+  服务端**归一化为 UTC**），无法解析或无时区 `422`；**首次设置**还必须
+  **严格晚于设置时的服务端当前时刻**，否则 `422`；
 - **同一发布版只能设置一次**：归一化 UTC 后**同版同时刻重试幂等**（`changed=false`，
-  不产生新变更、不写新行、不推进修订号/序号）；**同版异时刻 `409` 拒绝**
-  （截止不修改、不覆盖）；设置截止本身**不推进资料修订号与发布序号**；
+  不产生新变更、不写新行、不推进修订号/序号）；**即使首次设置成功后响应丢失、
+  截止到点后才用相同参数重试，也返回原设置而非误判为过期时刻 `422`**（同版同值
+  核对先于"晚于当前时刻"校验，均在写事务内完成）；**同版异时刻 `409` 拒绝**
+  （截止不修改、不覆盖，截止过后重试亦同）；设置截止本身**不推进资料修订号与发布序号**；
 - `GET /review-deadline` 可随时查看当前发布版的截止设置、是否已到截止、服务端当前
   UTC 时刻，以及各槽位状态与汇总：`unconfirmed`（未确认）、`confirmed_unsubmitted`
   （已确认未交）、`submitted`（已交）、`recused`（已回避，不计逾期）、`overdue`
@@ -474,7 +479,7 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | POST | `/assignment/publish` | 发布：携带 `{"base_revision": N}`，修订号过期 `409`，无可行方案 `422` |
 | POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` 及各等级已分配/未分配数量（`level_summary`）；无法完整覆盖时同样按 总数→高/中等级数→字典序 选取部分方案；**删除冻结的旧序号槽位在 `deleted_frozen_slots` 列明（补位发布时不沿用确认）**；**统一截止逾期只计当前仍有效槽位：删除冻结槽位（含同编号重录未重新发布）与撤回槽位不进 `overdue_slots`，旧截止不得阻止重录稿再次分给原评审人；其他论文真实逾期照常释放并以 `review_overdue` 禁止该稿原槽位重分** |
 | POST | `/assignment/backfill/publish` | 补位发布：`{"base_revision": N, "base_serial": M}` 双版本复核，过期 `409`，补不齐 `422`（均不改当前发布版）；响应附 `carried_confirmations`/`carried_reviews` 与 **`released_deleted_confirmations`/`deleted_frozen_slots`（删除重录后旧确认不沿用，须按新序号重新确认）**、`released_overdue_confirmations`/`overdue_slots`（真实逾期释放，两类冻结/逾期口径与预演一致，发布方案与预演相同） |
-| POST | `/review-deadline` | 为当前发布版设置一次统一 UTC 评审截止：`{"base_revision":N,"base_serial":M,"deadline_at":"2026-11-01T12:00:00Z"}`；时刻须显式携带时区（归一化 UTC）且晚于当前时刻；尚未发布 `404`，修订号/序号不符 `409`，非法/过去时刻 `422`；同版同时刻重试幂等（`changed=false`），同版异时刻 `409`；设置不推进修订号/序号、不改方案与历史 |
+| POST | `/review-deadline` | 为当前发布版设置一次统一 UTC 评审截止：`{"base_revision":N,"base_serial":M,"deadline_at":"2026-11-01T12:00:00Z"}`；写事务内先核对发布版（尚未发布 `404`）与修订号/序号（不符 `409`），再按归一化 UTC 核对同版已存设置；时刻无法解析/无时区 `422`，**首次设置**过去时刻 `422`；同版同时刻重试幂等（`changed=false`，**截止已过后同参数重试仍返回原设置、不误判 422**），同版异时刻 `409`（不覆盖）；设置不推进修订号/序号、不改方案与历史 |
 | GET | `/review-deadline` | 会务方查看当前发布版截止设置、是否已到截止、服务端 UTC 时刻，以及各槽位状态（`unconfirmed`/`confirmed_unsubmitted`/`submitted`/`recused`/`overdue`）与汇总计数；已撤回槽位单独标记（`withdrawn`）、不计入汇总；**删除凭据冻结当前序号的历史槽位（含同编号重录但未重新发布）带 `deleted=true` 标记并显示删除前历史状态，但不判逾期、不计入 `summary`，另以 `deleted_slots` 计数（旧确认/评语仅供会务方追溯）** |
 | GET | `/assignment` | 查询已发布方案（含 `serial`）及每篇论文的分配/排除原因、每槽位确认/回避状态；撤回稿仍在当前发布版视图中但带 `withdrawn=true` 与 `withdrawal_reason`（另返回 `withdrawn_papers` 清单），评审人侧则立即不可见 |
 | GET | `/papers/{paper_id}/reviews` | 会务方按论文查看当前两名评审人的评语提交进度、评语全文，及被移出槽位的追溯评语（`archived_reviews`）与全部更正记录（`corrections`）；撤回稿返回 `withdrawn=true` 与撤回记录（撤回后又重新发布过普通方案时 `slots` 为空、原评语全部在 `archived_reviews`） |
@@ -521,6 +526,10 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 （`./examples/guarantee_levels.sh`，建议对新库运行）；
 本轮统一 UTC 评审截止流程见 [`examples/deadlines.sh`](examples/deadlines.sh)
 （`./examples/deadlines.sh`，建议对新库运行）；
+本轮**截止设置响应丢失后的同参数重试幂等性修复**（首次设置成功后响应丢失、截止到点后
+同参数重试仍返回原设置 `changed=false` 而非 `422`；同版异值 `409`；首次设置仍须晚于
+服务端当前时刻）见 [`examples/deadline_retry.sh`](examples/deadline_retry.sh)
+（`./examples/deadline_retry.sh`，建议对新库运行）；
 本轮**删除凭据冻结序号与统一评审截止的交叉处理**（截止已过后删除并同编号重录：
 冻结槽位不计入截止汇总/补位逾期明细，旧截止不阻止重录稿再分原评审人；其他论文
 真实逾期照常释放并禁止该稿原槽位重分；补位发布推进序号后重新确认并提交）流程见
